@@ -153,6 +153,12 @@ abstract class VeloxUdfSuite extends GlutenQueryTest with SQLHelper {
           spark.sql(s"DROP TABLE IF EXISTS $tbl")
           spark.sql(s"DROP TEMPORARY FUNCTION IF EXISTS hive_string_string")
           spark.sql(s"DROP TEMPORARY FUNCTION IF EXISTS hive_int_to_string")
+          // UDFNames is a JVM-wide set filled from native when the backend starts, and the
+          // backend only starts once per JVM. The edits above would otherwise outlive this
+          // session and leave the next suite in this JVM with a registry that no longer matches
+          // the loaded library.
+          UDFResolver.UDFNames.add("org.apache.spark.sql.hive.execution.UDFStringString")
+          UDFResolver.UDFNames.remove("org.apache.spark.sql.hive.execution.UDFIntegerToString")
         }
     }
   }
@@ -299,6 +305,41 @@ abstract class VeloxUdfSuite extends GlutenQueryTest with SQLHelper {
     }
   }
 
+}
+
+/**
+ * The suites covering the default, off setting. Kept apart from the by-name suites so that each
+ * runs under exactly one value of NATIVE_UDF_BYPASS_REGISTRATION.
+ */
+abstract class VeloxUdfDefaultSuite extends VeloxUdfSuite {
+
+  test("a native udf is not injected by name when bypassRegistration is off") {
+    // The default. Injection is what the by-name suites opt into; without it a native function is
+    // reachable only through a hive class name, as it was before that option existed.
+    assert(
+      !VeloxConfig.nativeUDFBypassRegistration,
+      "this suite is meant to cover the default, off setting")
+    Seq("myudf_plus_one", "myudaf_avg").foreach {
+      name =>
+        assert(
+          spark.sessionState.functionRegistry
+            .lookupFunction(FunctionIdentifier(name))
+            .isEmpty,
+          s"$name should not be registered by name")
+    }
+  }
+}
+
+/**
+ * The by-name tests. Injecting a native function into the session's function registry is gated by
+ * NATIVE_UDF_BYPASS_REGISTRATION, which is off by default, so these live apart from the suites that
+ * cover the default: one setting per suite, and both get run.
+ */
+abstract class VeloxUdfByNameSuite extends VeloxUdfSuite {
+
+  override protected def sparkConf: SparkConf =
+    super.sparkConf.set(VeloxConfig.NATIVE_UDF_BYPASS_REGISTRATION.key, "true")
+
   test("native udf with a plain name is callable without a hive udf class") {
     // No CREATE TEMPORARY FUNCTION and no Java class: the session extension put the name in
     // Spark's registry via SparkInjector.injectFunction, which is the only writer for it.
@@ -364,17 +405,15 @@ abstract class VeloxUdfSuite extends GlutenQueryTest with SQLHelper {
   }
 }
 
-@UDFTest
-class VeloxUdfSuiteLocal extends VeloxUdfSuite {
+trait VeloxUdfLocalSetup extends VeloxUdfSuite {
 
   override val master: String = "local[2]"
+
   override protected def sparkConf: SparkConf = {
     super.sparkConf
       .set("spark.files", udfLibPath)
       .set(VeloxBackendSettings.GLUTEN_VELOX_UDF_LIB_PATHS, udfLibRelativePath)
       .set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.ColumnarShuffleManager")
-      // Off by default, so the by-name tests below have to opt in.
-      .set(VeloxConfig.NATIVE_UDF_BYPASS_REGISTRATION.key, "true")
   }
 }
 
@@ -384,25 +423,11 @@ class VeloxUdfSuiteLocal extends VeloxUdfSuite {
 //
 // VM options:
 // -Dspark.test.home=${SPARK_HOME}
-// -Dgluten.package.jar=\
-// /path/to/gluten/package/target/gluten-package-${project.version}.jar
 // -Dvelox.udf.lib.path=\
 // /path/to/gluten/cpp/build/velox/udf/examples/libmyudf.so
-@SkipTest
-class VeloxUdfSuiteCluster extends VeloxUdfSuite {
+trait VeloxUdfClusterSetup extends VeloxUdfSuite {
 
   override val master: String = "local-cluster[2,2,1024]"
-
-  val GLUTEN_JAR: String = "gluten.package.jar"
-
-  private lazy val glutenJar = sys.props.get(GLUTEN_JAR) match {
-    case Some(jar) => jar
-    case None =>
-      throw new IllegalArgumentException(
-        GLUTEN_JAR + s" cannot be null. You may set it by adding " +
-          s"-D$GLUTEN_JAR=" +
-          "/path/to/gluten/package/target/gluten-package-${project.version}.jar")
-  }
 
   private lazy val driverUdfLibPath =
     udfLibPath.split(",").map("file://" + _).mkString(",")
@@ -412,7 +437,23 @@ class VeloxUdfSuiteCluster extends VeloxUdfSuite {
       .set("spark.files", udfLibPath)
       .set(VeloxBackendSettings.GLUTEN_VELOX_DRIVER_UDF_LIB_PATHS, driverUdfLibPath)
       .set(VeloxBackendSettings.GLUTEN_VELOX_UDF_LIB_PATHS, udfLibRelativePath)
-      .set("spark.driver.extraClassPath", glutenJar)
-      .set("spark.executor.extraClassPath", glutenJar)
+      // The driver is this test JVM, which runs Gluten from the module classes on the test
+      // classpath; spark.driver.extraClassPath cannot change a JVM that is already running.
+      // Executors have to load the same classes. Handing them the package jar instead meant
+      // protobuf was relocated on one side and not the other, so a plan node with a protobuf
+      // field, such as AdvancedExtensionNode, failed to deserialize on the executor.
+      .set("spark.executor.extraClassPath", sys.props("java.class.path"))
   }
 }
+
+@UDFTest
+class VeloxUdfSuiteLocal extends VeloxUdfDefaultSuite with VeloxUdfLocalSetup
+
+@UDFTest
+class VeloxUdfByNameSuiteLocal extends VeloxUdfByNameSuite with VeloxUdfLocalSetup
+
+@SkipTest
+class VeloxUdfSuiteCluster extends VeloxUdfDefaultSuite with VeloxUdfClusterSetup
+
+@SkipTest
+class VeloxUdfByNameSuiteCluster extends VeloxUdfByNameSuite with VeloxUdfClusterSetup

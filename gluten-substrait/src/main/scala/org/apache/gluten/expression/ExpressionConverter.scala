@@ -33,13 +33,44 @@ import org.apache.spark.sql.hive.HiveUDFTransformer
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
-import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
 
 trait Transformable {
   def getTransformer(childrenTransformers: Seq[ExpressionTransformer]): ExpressionTransformer
 }
 
 object ExpressionConverter extends SQLConfHelper with Logging {
+
+  /** Rebinds extraction paths to the input layout, including access through maps and arrays. */
+  private def bindToInputSchema(expression: Expression, input: AttributeSeq): Expression = {
+    if (expression.references.nonEmpty && (input == null || input.attrs == null)) {
+      throw new UnsupportedOperationException("attributeSeq should not be null.")
+    }
+    try {
+      expression.references.foldLeft(expression) {
+        case (bound, attribute) =>
+          val index = input.indexOf(attribute.exprId)
+          if (
+            index >= 0 &&
+            !DataType.equalsIgnoreNullability(attribute.dataType, input.attrs(index).dataType)
+          ) {
+            // Project one root at a time, using exprId to select its input type. Inputs such as
+            // joins can contain same-named attributes with different nested layouts.
+            val schema = StructType(Seq(StructField(attribute.name, input.attrs(index).dataType)))
+            val projectionOverSchema = ProjectionOverSchema(schema, AttributeSet(Seq(attribute)))
+            bound.transformDown { case projectionOverSchema(projected) => projected }
+          } else {
+            // Preserve resolved ordinals for unchanged layouts, including duplicate field names.
+            bound
+          }
+      }
+    } catch {
+      case NonFatal(e) =>
+        throw new UnsupportedOperationException(
+          s"Failed to bind reference for $expression: ${e.getMessage}",
+          e)
+    }
+  }
 
   def replaceWithExpressionTransformer(
       exprs: Seq[Expression],
@@ -519,33 +550,27 @@ object ExpressionConverter extends SQLConfHelper with Logging {
             expr => replaceWithExpressionTransformer0(expr, attributeSeq, expressionsMap)),
           m)
       case getStructField: GetStructField =>
-        try {
-          val bindRef =
-            bindGetStructField(getStructField, attributeSeq)
-          // Different backends may have different result.
-          BackendsApiManager.getSparkPlanExecApiInstance.genGetStructFieldTransformer(
-            substraitExprName,
-            replaceWithExpressionTransformer0(getStructField.child, attributeSeq, expressionsMap),
-            bindRef.ordinal,
-            getStructField)
-        } catch {
-          case e: IllegalStateException =>
-            // This situation may need developers to fix, although we just throw the below
-            // exception to let the corresponding operator fall back.
-            throw new UnsupportedOperationException(
-              s"Failed to bind reference for $getStructField: ${e.getMessage}")
-        }
+        val input = AttributeSeq(Option(attributeSeq).getOrElse(Seq.empty))
+        val boundStructField = bindToInputSchema(getStructField, input).asInstanceOf[GetStructField]
+        BackendsApiManager.getSparkPlanExecApiInstance.genGetStructFieldTransformer(
+          substraitExprName,
+          replaceWithExpressionTransformer0(boundStructField.child, attributeSeq, expressionsMap),
+          boundStructField.ordinal,
+          boundStructField)
 
       case getArrayStructFields: GetArrayStructFields =>
+        val input = AttributeSeq(Option(attributeSeq).getOrElse(Seq.empty))
+        val boundArrayStructFields =
+          bindToInputSchema(getArrayStructFields, input).asInstanceOf[GetArrayStructFields]
         GenericExpressionTransformer(
           substraitExprName,
           Seq(
             replaceWithExpressionTransformer0(
-              getArrayStructFields.child,
+              boundArrayStructFields.child,
               attributeSeq,
               expressionsMap),
-            LiteralTransformer(getArrayStructFields.ordinal)),
-          getArrayStructFields
+            LiteralTransformer(boundArrayStructFields.ordinal)),
+          boundArrayStructFields
         )
       case t: StringTranslate =>
         BackendsApiManager.getSparkPlanExecApiInstance.genStringTranslateTransformer(
@@ -955,48 +980,4 @@ object ExpressionConverter extends SQLConfHelper with Logging {
       }
   }
 
-  private def bindGetStructField(
-      structField: GetStructField,
-      input: AttributeSeq): BoundReference = {
-    // get the new ordinal base input
-    var newOrdinal: Int = -1
-    val names = new ArrayBuffer[String]
-    var root: Expression = structField
-    while (root.isInstanceOf[GetStructField]) {
-      val curField = root.asInstanceOf[GetStructField]
-      val name = curField.childSchema.fields(curField.ordinal).name
-      names += name
-      root = root.asInstanceOf[GetStructField].child
-    }
-    // For map/array type, the reference is correct no matter NESTED_SCHEMA_PRUNING_ENABLED or not
-    if (!root.isInstanceOf[AttributeReference]) {
-      return BoundReference(structField.ordinal, structField.dataType, structField.nullable)
-    }
-    names += root.asInstanceOf[AttributeReference].name
-    input.attrs.foreach(
-      attribute => {
-        var level = names.size - 1
-        if (names(level) == attribute.name) {
-          var candidateFields: Array[StructField] = null
-          var dtType = attribute.dataType
-          while (dtType.isInstanceOf[StructType] && level >= 1) {
-            candidateFields = dtType.asInstanceOf[StructType].fields
-            level -= 1
-            val curName = names(level)
-            for (i <- 0 until candidateFields.length) {
-              if (candidateFields(i).name == curName) {
-                dtType = candidateFields(i).dataType
-                newOrdinal = i
-              }
-            }
-          }
-        }
-      })
-    if (newOrdinal == -1) {
-      throw new IllegalStateException(
-        s"Couldn't find $structField in ${input.attrs.mkString("[", ",", "]")}")
-    } else {
-      BoundReference(newOrdinal, structField.dataType, structField.nullable)
-    }
-  }
 }
