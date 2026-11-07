@@ -17,11 +17,10 @@
 package org.apache.gluten.extension.columnar.rewrite
 
 import org.apache.spark.sql.catalyst.expressions.{EqualTo, Expression, In, Or}
-import org.apache.spark.sql.execution.{FileSourceScanExec, FilterExec, SparkPlan}
 import org.apache.spark.sql.types.StructType
 
 /**
- * This rule rewrites the [[In]] if the list option contains non-foldable value. A rewrite example:
+ * Lowers [[In]] with non-foldable list values during native expression conversion. For example:
  *
  * {{{
  *   SELECT * FROM t WHERE c in (1, 2, c2)
@@ -29,27 +28,22 @@ import org.apache.spark.sql.types.StructType
  *   SELECT * FROM t WHERE c in (1, 2) or c = c2
  * }}}
  *
- * TODO: Remove this rule once Velox support the list option in `In` is not literal.
+ * The original Catalyst expression is preserved for Spark fallback.
  */
-object RewriteIn extends RewriteSingleNode {
-  override def isRewritable(plan: SparkPlan): Boolean = {
-    plan match {
-      case _: FileSourceScanExec => true
-      case _: FilterExec => true
-      case _ => false
-    }
-  }
-
+object RewriteIn {
   private def shouldRewrite(e: Expression): Boolean = {
+    // Lowering can evaluate the value more than once and regroup list expressions.
     e match {
-      case in: In if !in.value.dataType.isInstanceOf[StructType] && in.list.exists(!_.foldable) =>
+      case in: In
+          if in.deterministic && !in.value.dataType.isInstanceOf[StructType] &&
+            in.list.exists(!_.foldable) =>
         // `EqualTo` does not allow struct type
         true
       case _ => false
     }
   }
 
-  private def rewriteIn(condition: Expression): Expression = {
+  private[gluten] def rewriteIn(condition: Expression): Expression = {
     condition.transform {
       case in: In if shouldRewrite(in) =>
         val (foldableExprs, nonFoldableExprs) = in.list.partition(_.foldable)
@@ -61,19 +55,6 @@ object RewriteIn extends RewriteSingleNode {
           Some(in.copy(list = foldableExprs))
         }
         (newIn ++ Seq(rewrittenExpr)).reduce(Or)
-    }
-  }
-
-  override def rewrite(plan: SparkPlan): SparkPlan = {
-    plan match {
-      // TODO: Support datasource v2
-      case scan: FileSourceScanExec if scan.dataFilters.exists(_.find(shouldRewrite).isDefined) =>
-        val newDataFilters = scan.dataFilters.map(rewriteIn)
-        scan.copy(dataFilters = newDataFilters)
-      case f: FilterExec if f.condition.find(shouldRewrite).isDefined =>
-        val newCondition = rewriteIn(f.condition)
-        f.copy(condition = newCondition)
-      case _ => plan
     }
   }
 }

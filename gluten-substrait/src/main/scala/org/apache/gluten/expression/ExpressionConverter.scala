@@ -18,6 +18,7 @@ package org.apache.gluten.expression
 
 import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.exception.GlutenNotSupportException
+import org.apache.gluten.extension.columnar.rewrite.RewriteIn
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.test.TestStats
 import org.apache.gluten.utils.DecimalArithmeticUtil
@@ -478,11 +479,15 @@ object ExpressionConverter extends SQLConfHelper with Logging {
           },
           cw
         )
-      case i: In =>
-        if (i.list.exists(!_.foldable)) {
+      case i: In if i.list.exists(!_.foldable) =>
+        val lowered = RewriteIn.rewriteIn(i)
+        if (lowered == i) {
           throw new GlutenNotSupportException(
             s"In list option does not support non-foldable expression, ${i.list.map(_.sql)}")
         }
+        // Use the same conversion for validation and translation, preserving the Spark expression.
+        replaceWithExpressionTransformer0(lowered, attributeSeq, expressionsMap)
+      case i: In =>
         InTransformer(
           substraitExprName,
           replaceWithExpressionTransformer0(i.value, attributeSeq, expressionsMap),

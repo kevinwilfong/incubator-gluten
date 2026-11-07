@@ -90,7 +90,6 @@ object BoltRuleApi {
       Validators.newValidator(conf, offloads)
     val rewrites =
       Seq(
-        RewriteIn,
         RewriteMultiChildrenCount,
         RewriteJoin,
         PullOutPreProject,
